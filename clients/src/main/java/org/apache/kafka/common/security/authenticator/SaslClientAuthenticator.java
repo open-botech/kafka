@@ -206,6 +206,15 @@ public class SaslClientAuthenticator implements Authenticator {
     // visible for testing
     SaslClient createSaslClient() {
         try {
+            String kerberosDomaiName = (String)configs.get(SaslConfigs.SASL_KERBEROS_DOMAIN_NAME);
+            if(kerberosDomaiName != null&& !kerberosDomaiName.equals("")) {
+                return Subject.doAs(subject, (PrivilegedExceptionAction<SaslClient>) () -> {
+                    String[] mechs = {mechanism};
+                    LOG.debug("Creating SaslClient: client={};service={};serviceDomainname={};mechs={}",
+                            clientPrincipalName, servicePrincipal, kerberosDomaiName, Arrays.toString(mechs));
+                    return Sasl.createSaslClient(mechs, clientPrincipalName, servicePrincipal, kerberosDomaiName, configs, callbackHandler);
+                });
+            }
             return Subject.doAs(subject, (PrivilegedExceptionAction<SaslClient>) () -> {
                 String[] mechs = {mechanism};
                 LOG.debug("Creating SaslClient: client={};service={};serviceHostname={};mechs={}",

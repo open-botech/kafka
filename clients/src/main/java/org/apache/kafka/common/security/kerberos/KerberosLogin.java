@@ -78,7 +78,9 @@ public class KerberosLogin extends AbstractLogin {
     private volatile Subject subject;
 
     private LoginContext loginContext;
+
     private String serviceName;
+
     private long lastLogin;
 
     @Override
@@ -277,6 +279,8 @@ public class KerberosLogin extends AbstractLogin {
     public Subject subject() {
         return subject;
     }
+
+
 
     @Override
     public String serviceName() {

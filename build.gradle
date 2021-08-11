@@ -207,8 +207,8 @@ subprojects {
           // To test locally, replace mavenUrl in ~/.gradle/gradle.properties to file://localhost/tmp/myRepo/
           mavenDeployer {
               beforeDeployment { MavenDeployment deployment -> signing.signPom(deployment) }
-              repository(url: "${mavenUrl}") {
-                  authentication(userName: "${mavenUsername}", password: "${mavenPassword}")
+              repository(url: "http://192.168.3.249:8081/repository/botech-common-snapshots") {
+                  authentication(userName: "deployment", password: "deployment")
               }
               afterEvaluate {
                   pom.artifactId = "${archivesBaseName}"
@@ -465,6 +465,7 @@ subprojects {
     }
     
   // these options are valid for Scala versions < 2.13 only
+  // Scala 2.13 removes them, see https://github.com/scala/scala/pull/6502 and https://github.com/scala/scala/pull/5969
   // Scala 2.13 removes them, see https://github.com/scala/scala/pull/6502 and https://github.com/scala/scala/pull/5969
     if (versions.baseScala in ['2.11','2.12']) {
       scalaCompileOptions.additionalParameters += [
