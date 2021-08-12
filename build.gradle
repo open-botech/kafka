@@ -73,10 +73,26 @@ allprojects {
         }
       }
     }
-    configurations {
-      runtime {
+    configurations.all {
+      // zinc is the Scala incremental compiler, it has a configuration for its own dependencies
+      // that are unrelated to the project dependencies, we should not change them
+      if (name != "zinc") {
         resolutionStrategy {
-          force "com.fasterxml.jackson.core:jackson-annotations:$versions.jackson"
+          force(
+            // ensure we have a single version of scala jars in the classpath, we enable inlining
+            // in the scala compiler for the `core` module so binary compatibility is only
+            // guaranteed if the exact same version of the scala jars is used for compilation
+            // and at runtime
+            libs.scalaLibrary,
+            libs.scalaReflect,
+            // ensures we have a single version of jackson-annotations in the classpath even if
+            // some modules only have a transitive reference to an older version
+            libs.jacksonAnnotations,
+            // be explicit about the Netty dependency version instead of relying on the version
+            // set by ZooKeeper (potentially older and containing CVEs)
+            libs.nettyHandler,
+            libs.nettyTransportNativeEpoll
+          )
         }
       }
     }
@@ -96,6 +112,7 @@ ext {
   buildVersionFileName = "kafka-version.properties"
 
   userMaxForks = project.hasProperty('maxParallelForks') ? maxParallelForks.toInteger() : null
+  userIgnoreFailures = project.hasProperty('ignoreFailures') ? ignoreFailures : false
 
   skipSigning = project.hasProperty('skipSigning') && skipSigning.toBoolean()
   shouldSign = !skipSigning && !version.endsWith("SNAPSHOT") && project.gradle.startParameter.taskNames.any { it.contains("upload") }
@@ -190,8 +207,8 @@ subprojects {
           // To test locally, replace mavenUrl in ~/.gradle/gradle.properties to file://localhost/tmp/myRepo/
           mavenDeployer {
               beforeDeployment { MavenDeployment deployment -> signing.signPom(deployment) }
-              repository(url: "${mavenUrl}") {
-                  authentication(userName: "${mavenUsername}", password: "${mavenPassword}")
+              repository(url: "http://192.168.3.249:8081/repository/botech-common-snapshots") {
+                  authentication(userName: "deployment", password: "deployment")
               }
               afterEvaluate {
                   pom.artifactId = "${archivesBaseName}"
@@ -284,6 +301,7 @@ subprojects {
 
   test {
     maxParallelForks = userMaxForks ?: Runtime.runtime.availableProcessors()
+    ignoreFailures = userIgnoreFailures
 
     minHeapSize = "256m"
     maxHeapSize = "2048m"
@@ -298,6 +316,7 @@ subprojects {
 
   task integrationTest(type: Test, dependsOn: compileJava) {
     maxParallelForks = userMaxForks ?: Runtime.runtime.availableProcessors()
+    ignoreFailures = userIgnoreFailures
 
     minHeapSize = "256m"
     maxHeapSize = "2048m"
@@ -308,6 +327,10 @@ subprojects {
       exceptionFormat = testExceptionFormat
     }
     logTestStdout.rehydrate(delegate, owner, this)()
+
+    // The suites are for running sets of tests in IDEs.
+    // Gradle will run each test class, so we exclude the suites to avoid redundantly running the tests twice.
+    exclude '**/*Suite.class'
 
     useJUnit {
       includeCategories 'org.apache.kafka.test.IntegrationTest'
@@ -317,6 +340,7 @@ subprojects {
 
   task unitTest(type: Test, dependsOn: compileJava) {
     maxParallelForks = userMaxForks ?: Runtime.runtime.availableProcessors()
+    ignoreFailures = userIgnoreFailures
 
     minHeapSize = "256m"
     maxHeapSize = "2048m"
@@ -327,6 +351,10 @@ subprojects {
       exceptionFormat = testExceptionFormat
     }
     logTestStdout.rehydrate(delegate, owner, this)()
+    
+    // The suites are for running sets of tests in IDEs.
+    // Gradle will run each test class, so we exclude the suites to avoid redundantly running the tests twice.
+    exclude '**/*Suite.class'
 
     if (it.project.name != 'generator') {
       useJUnit {
@@ -437,6 +465,7 @@ subprojects {
     }
     
   // these options are valid for Scala versions < 2.13 only
+  // Scala 2.13 removes them, see https://github.com/scala/scala/pull/6502 and https://github.com/scala/scala/pull/5969
   // Scala 2.13 removes them, see https://github.com/scala/scala/pull/6502 and https://github.com/scala/scala/pull/5969
     if (versions.baseScala in ['2.11','2.12']) {
       scalaCompileOptions.additionalParameters += [
@@ -694,7 +723,6 @@ project(':core') {
     compile(libs.zookeeper) {
       exclude module: 'slf4j-log4j12'
       exclude module: 'log4j'
-      exclude module: 'netty'
     }
     // ZooKeeperMain depends on commons-cli but declares the dependency as `provided`
     compile libs.commonsCli
@@ -1246,11 +1274,24 @@ project(':streams') {
     standardOutput = new File(generatedDocsDir, "streams_config.html").newOutputStream()
   }
 
-  test {
-    // The suites are for running sets of tests in IDEs.
-    // Gradle will run each test class, so we exclude the suites to avoid redundantly running the tests twice.
-    exclude '**/*Suite.class'
-  }
+  task testAll(
+    dependsOn: [
+            ':streams:test',
+            ':streams:test-utils:test',
+            ':streams:streams-scala:test',
+            ':streams:upgrade-system-tests-0100:test',
+            ':streams:upgrade-system-tests-0101:test',
+            ':streams:upgrade-system-tests-0102:test',
+            ':streams:upgrade-system-tests-0110:test',
+            ':streams:upgrade-system-tests-10:test',
+            ':streams:upgrade-system-tests-11:test',
+            ':streams:upgrade-system-tests-20:test',
+            ':streams:upgrade-system-tests-21:test',
+            ':streams:upgrade-system-tests-22:test',
+            ':streams:upgrade-system-tests-23:test',
+            ':streams:examples:test'
+    ]
+  )
 }
 
 project(':streams:streams-scala') {

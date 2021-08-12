@@ -263,6 +263,16 @@ public class KafkaConfigBackingStore implements ConfigBackingStore {
         // Before startup, callbacks are *not* invoked. You can grab a snapshot after starting -- just take care that
         // updates can continue to occur in the background
         configLog.start();
+
+        int partitionCount = configLog.partitionCount();
+        if (partitionCount > 1) {
+            String msg = String.format("Topic '%s' supplied via the '%s' property is required "
+                    + "to have a single partition in order to guarantee consistency of "
+                    + "connector configurations, but found %d partitions.",
+                    topic, DistributedConfig.CONFIG_TOPIC_CONFIG, partitionCount);
+            throw new ConfigException(msg);
+        }
+
         started = true;
         log.info("Started KafkaConfigBackingStore");
     }
@@ -280,8 +290,8 @@ public class KafkaConfigBackingStore implements ConfigBackingStore {
     @Override
     public ClusterConfigState snapshot() {
         synchronized (lock) {
-            // Doing a shallow copy of the data is safe here because the complex nested data that is copied should all be
-            // immutable configs
+            // Only a shallow copy is performed here; in order to avoid accidentally corrupting the worker's view
+            // of the config topic, any nested structures should be copied before making modifications
             return new ClusterConfigState(
                     offset,
                     sessionKey,
@@ -548,6 +558,8 @@ public class KafkaConfigBackingStore implements ConfigBackingStore {
                         // Connector deletion will be written as a null value
                         log.info("Successfully processed removal of connector '{}'", connectorName);
                         connectorConfigs.remove(connectorName);
+                        connectorTaskCounts.remove(connectorName);
+                        taskConfigs.keySet().removeIf(taskId -> taskId.connector().equals(connectorName));
                         removed = true;
                     } else {
                         // Connector configs can be applied and callbacks invoked immediately
@@ -668,44 +680,42 @@ public class KafkaConfigBackingStore implements ConfigBackingStore {
                 if (started)
                     updateListener.onTaskConfigUpdate(updatedTasks);
             } else if (record.key().equals(SESSION_KEY_KEY)) {
-                synchronized (lock) {
-                    if (value.value() == null) {
-                        log.error("Ignoring session key because it is unexpectedly null");
-                        return;
-                    }
-                    if (!(value.value() instanceof Map)) {
-                        log.error("Ignoring session key because the value is not a Map but is {}", value.value().getClass());
-                        return;
-                    }
+                if (value.value() == null) {
+                    log.error("Ignoring session key because it is unexpectedly null");
+                    return;
+                }
+                if (!(value.value() instanceof Map)) {
+                    log.error("Ignoring session key because the value is not a Map but is {}", value.value().getClass());
+                    return;
+                }
 
-                    Map<String, Object> valueAsMap = (Map<String, Object>) value.value();
+                Map<String, Object> valueAsMap = (Map<String, Object>) value.value();
 
-                    Object sessionKey = valueAsMap.get("key");
-                    if (!(sessionKey instanceof String)) {
-                        log.error("Invalid data for session key 'key' field should be a String but is {}", sessionKey.getClass());
-                        return;
-                    }
-                    byte[] key = Base64.getDecoder().decode((String) sessionKey);
+                Object sessionKey = valueAsMap.get("key");
+                if (!(sessionKey instanceof String)) {
+                    log.error("Invalid data for session key 'key' field should be a String but is {}", sessionKey.getClass());
+                    return;
+                }
+                byte[] key = Base64.getDecoder().decode((String) sessionKey);
 
-                    Object keyAlgorithm = valueAsMap.get("algorithm");
-                    if (!(keyAlgorithm instanceof String)) {
-                        log.error("Invalid data for session key 'algorithm' field should be a String but it is {}", keyAlgorithm.getClass());
-                        return;
-                    }
+                Object keyAlgorithm = valueAsMap.get("algorithm");
+                if (!(keyAlgorithm instanceof String)) {
+                    log.error("Invalid data for session key 'algorithm' field should be a String but it is {}", keyAlgorithm.getClass());
+                    return;
+                }
 
-                    Object creationTimestamp = valueAsMap.get("creation-timestamp");
-                    if (!(creationTimestamp instanceof Long)) {
-                        log.error("Invalid data for session key 'creation-timestamp' field should be a long but it is {}", creationTimestamp.getClass());
-                        return;
-                    }
-                    KafkaConfigBackingStore.this.sessionKey = new SessionKey(
+                Object creationTimestamp = valueAsMap.get("creation-timestamp");
+                if (!(creationTimestamp instanceof Long)) {
+                    log.error("Invalid data for session key 'creation-timestamp' field should be a long but it is {}", creationTimestamp.getClass());
+                    return;
+                }
+                KafkaConfigBackingStore.this.sessionKey = new SessionKey(
                         new SecretKeySpec(key, (String) keyAlgorithm),
                         (long) creationTimestamp
-                    );
+                );
 
-                    if (started)
-                        updateListener.onSessionKeyUpdate(KafkaConfigBackingStore.this.sessionKey);
-                }
+                if (started)
+                    updateListener.onSessionKeyUpdate(KafkaConfigBackingStore.this.sessionKey);
             } else {
                 log.error("Discarding config update record with invalid key: {}", record.key());
             }

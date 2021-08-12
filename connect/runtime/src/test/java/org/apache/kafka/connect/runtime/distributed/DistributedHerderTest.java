@@ -84,6 +84,8 @@ import static javax.ws.rs.core.Response.Status.FORBIDDEN;
 import static org.apache.kafka.connect.runtime.distributed.ConnectProtocol.CONNECT_PROTOCOL_V0;
 import static org.apache.kafka.connect.runtime.distributed.IncrementalCooperativeConnectProtocol.CONNECT_PROTOCOL_V1;
 import static org.apache.kafka.connect.runtime.distributed.IncrementalCooperativeConnectProtocol.CONNECT_PROTOCOL_V2;
+import static org.easymock.EasyMock.capture;
+import static org.easymock.EasyMock.newCapture;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -198,7 +200,7 @@ public class DistributedHerderTest {
         connectProtocolVersion = CONNECT_PROTOCOL_V0;
 
         herder = PowerMock.createPartialMock(DistributedHerder.class,
-                new String[]{"backoff", "connectorTypeForClass", "updateDeletedConnectorStatus"},
+                new String[]{"connectorTypeForClass", "updateDeletedConnectorStatus", "updateDeletedTaskStatus"},
                 new DistributedConfig(HERDER_CONFIG), worker, WORKER_ID, KAFKA_CLUSTER_ID,
                 statusBackingStore, configBackingStore, member, MEMBER_URL, metrics, time, noneConnectorClientConfigOverridePolicy);
 
@@ -212,6 +214,7 @@ public class DistributedHerderTest {
         delegatingLoader = PowerMock.createMock(DelegatingClassLoader.class);
         PowerMock.mockStatic(Plugins.class);
         PowerMock.expectPrivate(herder, "updateDeletedConnectorStatus").andVoid().anyTimes();
+        PowerMock.expectPrivate(herder, "updateDeletedTaskStatus").andVoid().anyTimes();
     }
 
     @After
@@ -489,6 +492,104 @@ public class DistributedHerderTest {
     }
 
     @Test
+    public void testRevoke() throws TimeoutException {
+        revokeAndReassign(false);
+    }
+
+    @Test
+    public void testIncompleteRebalanceBeforeRevoke() throws TimeoutException {
+        revokeAndReassign(true);
+    }
+
+    public void revokeAndReassign(boolean incompleteRebalance) throws TimeoutException {
+        connectProtocolVersion = CONNECT_PROTOCOL_V1;
+        int configOffset = 1;
+
+        // Join group and get initial assignment
+        EasyMock.expect(member.memberId()).andStubReturn("member");
+        EasyMock.expect(member.currentProtocolVersion()).andStubReturn(connectProtocolVersion);
+        EasyMock.expect(worker.getPlugins()).andReturn(plugins);
+        expectRebalance(configOffset, Arrays.asList(CONN1), Arrays.asList(TASK1));
+        expectPostRebalanceCatchup(SNAPSHOT);
+        worker.startConnector(EasyMock.eq(CONN1), EasyMock.<Map<String, String>>anyObject(), EasyMock.<ConnectorContext>anyObject(),
+            EasyMock.eq(herder), EasyMock.eq(TargetState.STARTED));
+        PowerMock.expectLastCall().andAnswer(new IAnswer<Boolean>() {
+            @Override
+            public Boolean answer() throws Throwable {
+                return true;
+            }
+        });
+        EasyMock.expect(worker.isRunning(CONN1)).andReturn(true);
+        EasyMock.expect(worker.connectorTaskConfigs(CONN1, conn1SinkConfig)).andReturn(TASK_CONFIGS);
+        worker.startTask(EasyMock.eq(TASK1), EasyMock.<ClusterConfigState>anyObject(), EasyMock.<Map<String, String>>anyObject(), EasyMock.<Map<String, String>>anyObject(),
+            EasyMock.eq(herder), EasyMock.eq(TargetState.STARTED));
+        PowerMock.expectLastCall().andReturn(true);
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        // worker is stable with an existing set of tasks
+
+        if (incompleteRebalance) {
+            // Perform a partial re-balance just prior to the revocation
+            // bump the configOffset to trigger reading the config topic to the end
+            configOffset++;
+            expectRebalance(configOffset, Arrays.<String>asList(), Arrays.<ConnectorTaskId>asList());
+            // give it the wrong snapshot, as if we're out of sync/can't reach the broker
+            expectPostRebalanceCatchup(SNAPSHOT);
+            member.requestRejoin();
+            PowerMock.expectLastCall();
+            // tick exits early because we failed, and doesn't do the poll at the end of the method
+            // the worker did not startWork or reset the rebalanceResolved flag
+        }
+
+        // Revoke the connector in the next rebalance
+        expectRebalance(Arrays.asList(CONN1), Arrays.<ConnectorTaskId>asList(),
+            ConnectProtocol.Assignment.NO_ERROR, configOffset, Arrays.<String>asList(),
+            Arrays.<ConnectorTaskId>asList());
+
+        if (incompleteRebalance) {
+            // Same as SNAPSHOT, except with an updated offset
+            // Allow the task to read to the end of the topic and complete the rebalance
+            ClusterConfigState secondSnapshot = new ClusterConfigState(
+                configOffset, null, Collections.singletonMap(CONN1, 3),
+                Collections.singletonMap(CONN1, CONN1_CONFIG), Collections.singletonMap(CONN1, TargetState.STARTED),
+                TASK_CONFIGS_MAP, Collections.<String>emptySet());
+            expectPostRebalanceCatchup(secondSnapshot);
+        }
+        member.requestRejoin();
+        PowerMock.expectLastCall();
+
+        // re-assign the connector back to the same worker to ensure state was cleaned up
+        expectRebalance(configOffset, Arrays.asList(CONN1), Arrays.<ConnectorTaskId>asList());
+        EasyMock.expect(worker.getPlugins()).andReturn(plugins);
+        worker.startConnector(EasyMock.eq(CONN1), EasyMock.<Map<String, String>>anyObject(),
+            EasyMock.<ConnectorContext>anyObject(),
+            EasyMock.eq(herder), EasyMock.eq(TargetState.STARTED));
+        PowerMock.expectLastCall().andAnswer(new IAnswer<Boolean>() {
+            @Override
+            public Boolean answer() throws Throwable {
+                return true;
+            }
+        });
+        EasyMock.expect(worker.isRunning(CONN1)).andReturn(true);
+        EasyMock.expect(worker.connectorTaskConfigs(CONN1, conn1SinkConfig))
+            .andReturn(TASK_CONFIGS);
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        PowerMock.replayAll();
+
+        herder.tick();
+        if (incompleteRebalance) {
+            herder.tick();
+        }
+        herder.tick();
+        herder.tick();
+
+        PowerMock.verifyAll();
+    }
+
+    @Test
     public void testHaltCleansUpWorker() {
         EasyMock.expect(worker.connectorNames()).andReturn(Collections.singleton(CONN1));
         worker.stopConnector(CONN1);
@@ -525,7 +626,7 @@ public class DistributedHerderTest {
         // config validation
         Connector connectorMock = PowerMock.createMock(SourceConnector.class);
         EasyMock.expect(worker.configTransformer()).andReturn(transformer).times(2);
-        final Capture<Map<String, String>> configCapture = EasyMock.newCapture();
+        final Capture<Map<String, String>> configCapture = newCapture();
         EasyMock.expect(transformer.transform(EasyMock.capture(configCapture))).andAnswer(configCapture::getValue);
         EasyMock.expect(worker.getPlugins()).andReturn(plugins).times(3);
         EasyMock.expect(plugins.compareAndSwapLoaders(connectorMock)).andReturn(delegatingLoader);
@@ -572,7 +673,7 @@ public class DistributedHerderTest {
         // config validation
         Connector connectorMock = PowerMock.createMock(SourceConnector.class);
         EasyMock.expect(worker.configTransformer()).andReturn(transformer).times(2);
-        final Capture<Map<String, String>> configCapture = EasyMock.newCapture();
+        final Capture<Map<String, String>> configCapture = newCapture();
         EasyMock.expect(transformer.transform(EasyMock.capture(configCapture))).andAnswer(configCapture::getValue);
         EasyMock.expect(worker.getPlugins()).andReturn(plugins).times(3);
         EasyMock.expect(plugins.compareAndSwapLoaders(connectorMock)).andReturn(delegatingLoader);
@@ -586,7 +687,7 @@ public class DistributedHerderTest {
 
         // CONN2 creation should fail
 
-        Capture<Throwable> error = EasyMock.newCapture();
+        Capture<Throwable> error = newCapture();
         putConnectorCallback.onCompletion(EasyMock.capture(error), EasyMock.<Herder.Created<ConnectorInfo>>isNull());
         PowerMock.expectLastCall();
 
@@ -621,7 +722,7 @@ public class DistributedHerderTest {
         // config validation
         Connector connectorMock = PowerMock.createMock(SourceConnector.class);
         EasyMock.expect(worker.configTransformer()).andReturn(transformer).times(2);
-        final Capture<Map<String, String>> configCapture = EasyMock.newCapture();
+        final Capture<Map<String, String>> configCapture = newCapture();
         EasyMock.expect(transformer.transform(EasyMock.capture(configCapture))).andAnswer(configCapture::getValue);
         EasyMock.expect(worker.getPlugins()).andReturn(plugins).times(3);
         EasyMock.expect(plugins.compareAndSwapLoaders(connectorMock)).andReturn(delegatingLoader);
@@ -638,7 +739,7 @@ public class DistributedHerderTest {
 
         // CONN2 creation should fail
 
-        Capture<Throwable> error = EasyMock.newCapture();
+        Capture<Throwable> error = newCapture();
         putConnectorCallback.onCompletion(EasyMock.capture(error), EasyMock.<Herder.Created<ConnectorInfo>>isNull());
         PowerMock.expectLastCall();
 
@@ -677,7 +778,7 @@ public class DistributedHerderTest {
         // config validation
         Connector connectorMock = PowerMock.createMock(SinkConnector.class);
         EasyMock.expect(worker.configTransformer()).andReturn(transformer).times(2);
-        final Capture<Map<String, String>> configCapture = EasyMock.newCapture();
+        final Capture<Map<String, String>> configCapture = newCapture();
         EasyMock.expect(transformer.transform(EasyMock.capture(configCapture))).andAnswer(configCapture::getValue);
         EasyMock.expect(worker.getPlugins()).andReturn(plugins).times(3);
         EasyMock.expect(plugins.compareAndSwapLoaders(connectorMock)).andReturn(delegatingLoader);
@@ -689,7 +790,7 @@ public class DistributedHerderTest {
         // CONN2 creation should fail because the worker group id (connect-test-group) conflicts with
         // the consumer group id we would use for this sink
 
-        Capture<Throwable> error = EasyMock.newCapture();
+        Capture<Throwable> error = newCapture();
         putConnectorCallback.onCompletion(EasyMock.capture(error), EasyMock.isNull(Herder.Created.class));
         PowerMock.expectLastCall();
 
@@ -716,7 +817,7 @@ public class DistributedHerderTest {
         EasyMock.expect(member.memberId()).andStubReturn("leader");
         EasyMock.expect(member.currentProtocolVersion()).andStubReturn(CONNECT_PROTOCOL_V0);
         EasyMock.expect(worker.configTransformer()).andReturn(transformer).times(2);
-        final Capture<Map<String, String>> configCapture = EasyMock.newCapture();
+        final Capture<Map<String, String>> configCapture = newCapture();
         EasyMock.expect(transformer.transform(EasyMock.capture(configCapture))).andAnswer(configCapture::getValue);
         EasyMock.expect(worker.getPlugins()).andReturn(plugins);
         EasyMock.expect(plugins.newConnector(EasyMock.anyString())).andReturn(null);
@@ -1449,7 +1550,6 @@ public class DistributedHerderTest {
         EasyMock.expectLastCall().andThrow(new TimeoutException());
         member.maybeLeaveGroup(EasyMock.eq("taking too long to read the log"));
         EasyMock.expectLastCall();
-        PowerMock.expectPrivate(herder, "backoff", DistributedConfig.WORKER_UNSYNC_BACKOFF_MS_DEFAULT);
         member.requestRejoin();
 
         // After backoff, restart the process and this time succeed
@@ -1469,16 +1569,209 @@ public class DistributedHerderTest {
         member.poll(EasyMock.anyInt());
         PowerMock.expectLastCall();
 
+        // one more tick, to make sure we don't keep trying to read to the config topic unnecessarily
+        expectRebalance(1, Collections.emptyList(), Collections.emptyList());
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
         PowerMock.replayAll();
 
+        long before = time.milliseconds();
+        int workerUnsyncBackoffMs = DistributedConfig.WORKER_UNSYNC_BACKOFF_MS_DEFAULT;
+        int coordinatorDiscoveryTimeoutMs = 100;
         herder.tick();
+        assertEquals(before + coordinatorDiscoveryTimeoutMs + workerUnsyncBackoffMs, time.milliseconds());
+
         time.sleep(1000L);
         assertStatistics("leaderUrl", true, 3, 0, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY);
 
+        before = time.milliseconds();
         herder.tick();
+        assertEquals(before + coordinatorDiscoveryTimeoutMs, time.milliseconds());
         time.sleep(2000L);
         assertStatistics("leaderUrl", false, 3, 1, 100, 2000L);
 
+        // tick once more to ensure that the successful read to the end of the config topic was 
+        // tracked and no further unnecessary attempts were made
+        herder.tick();
+
+        PowerMock.verifyAll();
+    }
+
+    @Test
+    public void testJoinLeaderCatchUpRetriesForIncrementalCooperative() throws Exception {
+        connectProtocolVersion = CONNECT_PROTOCOL_V1;
+
+        // Join group and as leader fail to do assignment
+        EasyMock.expect(member.memberId()).andStubReturn("leader");
+        EasyMock.expect(member.currentProtocolVersion()).andStubReturn(CONNECT_PROTOCOL_V1);
+        expectRebalance(1, Arrays.asList(CONN1), Arrays.asList(TASK1));
+        expectPostRebalanceCatchup(SNAPSHOT);
+
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        // The leader got its assignment
+        expectRebalance(Collections.emptyList(), Collections.emptyList(),
+                ConnectProtocol.Assignment.NO_ERROR,
+                1, Arrays.asList(CONN1), Arrays.asList(TASK1), 0);
+
+        EasyMock.expect(worker.getPlugins()).andReturn(plugins);
+        // and the new assignment started
+        worker.startConnector(EasyMock.eq(CONN1), EasyMock.anyObject(), EasyMock.anyObject(),
+                EasyMock.eq(herder), EasyMock.eq(TargetState.STARTED));
+        PowerMock.expectLastCall().andReturn(true);
+        EasyMock.expect(worker.isRunning(CONN1)).andReturn(true);
+        EasyMock.expect(worker.connectorTaskConfigs(CONN1, conn1SinkConfig)).andReturn(TASK_CONFIGS);
+
+        worker.startTask(EasyMock.eq(TASK1), EasyMock.anyObject(), EasyMock.anyObject(), EasyMock.anyObject(),
+                EasyMock.eq(herder), EasyMock.eq(TargetState.STARTED));
+        PowerMock.expectLastCall().andReturn(true);
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        // Another rebalance is triggered but this time it fails to read to the max offset and
+        // triggers a re-sync
+        expectRebalance(Collections.<String>emptyList(), Collections.<ConnectorTaskId>emptyList(),
+                ConnectProtocol.Assignment.CONFIG_MISMATCH, 1, Collections.<String>emptyList(),
+                Collections.<ConnectorTaskId>emptyList());
+
+        // The leader will retry a few times to read to the end of the config log
+        int retries = 2;
+        member.requestRejoin();
+        for (int i = retries; i >= 0; --i) {
+            // Reading to end of log times out
+            configBackingStore.refresh(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+            EasyMock.expectLastCall().andThrow(new TimeoutException());
+            member.maybeLeaveGroup(EasyMock.eq("taking too long to read the log"));
+            EasyMock.expectLastCall();
+        }
+
+        // After a few retries succeed to read the log to the end
+        expectRebalance(Collections.emptyList(), Collections.emptyList(),
+                ConnectProtocol.Assignment.NO_ERROR,
+                1, Arrays.asList(CONN1), Arrays.asList(TASK1), 0);
+        expectPostRebalanceCatchup(SNAPSHOT);
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        PowerMock.replayAll();
+
+        assertStatistics(0, 0, 0, Double.POSITIVE_INFINITY);
+        herder.tick();
+
+        time.sleep(2000L);
+        assertStatistics(3, 1, 100, 2000);
+        herder.tick();
+
+        long before;
+        int coordinatorDiscoveryTimeoutMs = 100;
+        int maxRetries = 5;
+        for (int i = maxRetries; i >= maxRetries - retries; --i) {
+            before = time.milliseconds();
+            int workerUnsyncBackoffMs =
+                    DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT / 10 / i;
+            herder.tick();
+            assertEquals(before + coordinatorDiscoveryTimeoutMs + workerUnsyncBackoffMs, time.milliseconds());
+            coordinatorDiscoveryTimeoutMs = 0;
+        }
+
+        before = time.milliseconds();
+        coordinatorDiscoveryTimeoutMs = 100;
+        herder.tick();
+        assertEquals(before + coordinatorDiscoveryTimeoutMs, time.milliseconds());
+
+        PowerMock.verifyAll();
+    }
+
+    @Test
+    public void testJoinLeaderCatchUpFailsForIncrementalCooperative() throws Exception {
+        connectProtocolVersion = CONNECT_PROTOCOL_V1;
+
+        // Join group and as leader fail to do assignment
+        EasyMock.expect(member.memberId()).andStubReturn("leader");
+        EasyMock.expect(member.currentProtocolVersion()).andStubReturn(CONNECT_PROTOCOL_V1);
+        expectRebalance(1, Arrays.asList(CONN1), Arrays.asList(TASK1));
+        expectPostRebalanceCatchup(SNAPSHOT);
+
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        // The leader got its assignment
+        expectRebalance(Collections.emptyList(), Collections.emptyList(),
+                ConnectProtocol.Assignment.NO_ERROR,
+                1, Arrays.asList(CONN1), Arrays.asList(TASK1), 0);
+
+        EasyMock.expect(worker.getPlugins()).andReturn(plugins);
+        // and the new assignment started
+        worker.startConnector(EasyMock.eq(CONN1), EasyMock.anyObject(), EasyMock.anyObject(),
+                EasyMock.eq(herder), EasyMock.eq(TargetState.STARTED));
+        PowerMock.expectLastCall().andReturn(true);
+        EasyMock.expect(worker.isRunning(CONN1)).andReturn(true);
+        EasyMock.expect(worker.connectorTaskConfigs(CONN1, conn1SinkConfig)).andReturn(TASK_CONFIGS);
+
+        worker.startTask(EasyMock.eq(TASK1), EasyMock.anyObject(), EasyMock.anyObject(), EasyMock.anyObject(),
+                EasyMock.eq(herder), EasyMock.eq(TargetState.STARTED));
+        PowerMock.expectLastCall().andReturn(true);
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        // Another rebalance is triggered but this time it fails to read to the max offset and
+        // triggers a re-sync
+        expectRebalance(Collections.<String>emptyList(), Collections.<ConnectorTaskId>emptyList(),
+                ConnectProtocol.Assignment.CONFIG_MISMATCH, 1, Collections.<String>emptyList(),
+                Collections.<ConnectorTaskId>emptyList());
+
+        // The leader will exhaust the retries while trying to read to the end of the config log
+        int maxRetries = 5;
+        member.requestRejoin();
+        for (int i = maxRetries; i >= 0; --i) {
+            // Reading to end of log times out
+            configBackingStore.refresh(EasyMock.anyLong(), EasyMock.anyObject(TimeUnit.class));
+            EasyMock.expectLastCall().andThrow(new TimeoutException());
+            member.maybeLeaveGroup(EasyMock.eq("taking too long to read the log"));
+            EasyMock.expectLastCall();
+        }
+
+        Capture<ExtendedAssignment> assignmentCapture = newCapture();
+        member.revokeAssignment(capture(assignmentCapture));
+        PowerMock.expectLastCall();
+
+        // After a complete backoff and a revocation of running tasks rejoin and this time succeed
+        // The worker gets back the assignment that had given up
+        expectRebalance(Collections.emptyList(), Collections.emptyList(),
+                ConnectProtocol.Assignment.NO_ERROR,
+                1, Arrays.asList(CONN1), Arrays.asList(TASK1), 0);
+        expectPostRebalanceCatchup(SNAPSHOT);
+        member.poll(EasyMock.anyInt());
+        PowerMock.expectLastCall();
+
+        PowerMock.replayAll();
+
+        assertStatistics(0, 0, 0, Double.POSITIVE_INFINITY);
+        herder.tick();
+
+        time.sleep(2000L);
+        assertStatistics(3, 1, 100, 2000);
+        herder.tick();
+
+        long before;
+        int coordinatorDiscoveryTimeoutMs = 100;
+        for (int i = maxRetries; i > 0; --i) {
+            before = time.milliseconds();
+            int workerUnsyncBackoffMs =
+                    DistributedConfig.SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT / 10 / i;
+            herder.tick();
+            assertEquals(before + coordinatorDiscoveryTimeoutMs + workerUnsyncBackoffMs, time.milliseconds());
+            coordinatorDiscoveryTimeoutMs = 0;
+        }
+
+        before = time.milliseconds();
+        herder.tick();
+        assertEquals(before, time.milliseconds());
+        assertEquals(Collections.singleton(CONN1), assignmentCapture.getValue().connectors());
+        assertEquals(Collections.singleton(TASK1), assignmentCapture.getValue().tasks());
+        herder.tick();
 
         PowerMock.verifyAll();
     }
@@ -1565,7 +1858,7 @@ public class DistributedHerderTest {
         // config validation
         Connector connectorMock = PowerMock.createMock(SourceConnector.class);
         EasyMock.expect(worker.configTransformer()).andReturn(transformer).times(2);
-        final Capture<Map<String, String>> configCapture = EasyMock.newCapture();
+        final Capture<Map<String, String>> configCapture = newCapture();
         EasyMock.expect(transformer.transform(EasyMock.capture(configCapture))).andAnswer(configCapture::getValue);
         EasyMock.expect(worker.getPlugins()).andReturn(plugins).anyTimes();
         EasyMock.expect(plugins.compareAndSwapLoaders(connectorMock)).andReturn(delegatingLoader);
@@ -1806,7 +2099,7 @@ public class DistributedHerderTest {
                 } else {
                     assignment = new ExtendedAssignment(
                             connectProtocolVersion, error, "leader", "leaderUrl", offset,
-                            assignedConnectors, assignedTasks,
+                            new ArrayList<>(assignedConnectors), new ArrayList<>(assignedTasks),
                             new ArrayList<>(revokedConnectors), new ArrayList<>(revokedTasks), delay);
                 }
                 rebalanceListener.onAssigned(assignment, 3);

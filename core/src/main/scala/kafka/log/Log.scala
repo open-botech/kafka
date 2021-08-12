@@ -411,8 +411,11 @@ class Log(@volatile var dir: File,
   private def fetchLastStableOffsetMetadata: LogOffsetMetadata = {
     checkIfMemoryMappedBufferClosed()
 
+    // cache the current high watermark to avoid a concurrent update invalidating the range check
+    val highWatermarkMetadata = fetchHighWatermarkMetadata
+
     firstUnstableOffsetMetadata match {
-      case Some(offsetMetadata) if offsetMetadata.messageOffset < highWatermark =>
+      case Some(offsetMetadata) if offsetMetadata.messageOffset < highWatermarkMetadata.messageOffset =>
         if (offsetMetadata.messageOffsetOnly) {
           lock synchronized {
             val fullOffset = convertToOffsetMetadataOrThrow(offsetMetadata.messageOffset)
@@ -423,7 +426,7 @@ class Log(@volatile var dir: File,
         } else {
           offsetMetadata
         }
-      case _ => fetchHighWatermarkMetadata
+      case _ => highWatermarkMetadata
     }
   }
 
@@ -1477,10 +1480,7 @@ class Log(@volatile var dir: File,
       // Because we don't use the lock for reading, the synchronization is a little bit tricky.
       // We create the local variables to avoid race conditions with updates to the log.
       val endOffsetMetadata = nextOffsetMetadata
-      val endOffset = nextOffsetMetadata.messageOffset
-      if (startOffset == endOffset)
-        return emptyFetchDataInfo(endOffsetMetadata, includeAbortedTxns)
-
+      val endOffset = endOffsetMetadata.messageOffset
       var segmentEntry = segments.floorEntry(startOffset)
 
       // return error on attempt to read beyond the log end offset or read below log start offset
@@ -1489,12 +1489,14 @@ class Log(@volatile var dir: File,
           s"but we only have log segments in the range $logStartOffset to $endOffset.")
 
       val maxOffsetMetadata = isolation match {
-        case FetchLogEnd => nextOffsetMetadata
+        case FetchLogEnd => endOffsetMetadata
         case FetchHighWatermark => fetchHighWatermarkMetadata
         case FetchTxnCommitted => fetchLastStableOffsetMetadata
       }
 
-      if (startOffset > maxOffsetMetadata.messageOffset) {
+      if (startOffset == maxOffsetMetadata.messageOffset) {
+        return emptyFetchDataInfo(maxOffsetMetadata, includeAbortedTxns)
+      } else if (startOffset > maxOffsetMetadata.messageOffset) {
         val startOffsetMetadata = convertToOffsetMetadataOrThrow(startOffset)
         return emptyFetchDataInfo(startOffsetMetadata, includeAbortedTxns)
       }
@@ -2070,6 +2072,15 @@ class Log(@volatile var dir: File,
         throw new IllegalArgumentException(s"Cannot truncate partition $topicPartition to a negative offset (%d).".format(targetOffset))
       if (targetOffset >= logEndOffset) {
         info(s"Truncating to $targetOffset has no effect as the largest offset in the log is ${logEndOffset - 1}")
+
+        // Always truncate epoch cache since we may have a conflicting epoch entry at the
+        // end of the log from the leader. This could happen if this broker was a leader
+        // and inserted the first start offset entry, but then failed to append any entries
+        // before another leader was elected.
+        lock synchronized {
+          leaderEpochCache.foreach(_.truncateFromEnd(logEndOffset))
+        }
+
         false
       } else {
         info(s"Truncating to offset $targetOffset")
@@ -2138,17 +2149,22 @@ class Log(@volatile var dir: File,
 
   /**
    * Get all segments beginning with the segment that includes "from" and ending with the segment
-   * that includes up to "to-1" or the end of the log (if to > logEndOffset)
+   * that includes up to "to-1" or the end of the log (if to > logEndOffset).
    */
   def logSegments(from: Long, to: Long): Iterable[LogSegment] = {
-    lock synchronized {
-      val view = Option(segments.floorKey(from)).map { floor =>
-        if (to < floor)
-          throw new IllegalArgumentException(s"Invalid log segment range: requested segments in $topicPartition " +
-            s"from offset $from mapping to segment with base offset $floor, which is greater than limit offset $to")
-        segments.subMap(floor, to)
-      }.getOrElse(segments.headMap(to))
-      view.values.asScala
+    if (from == to) {
+      // Handle non-segment-aligned empty sets
+      List.empty[LogSegment]
+    } else if (to < from) {
+      throw new IllegalArgumentException(s"Invalid log segment range: requested segments in $topicPartition " +
+        s"from offset $from which is greater than limit offset $to")
+    } else {
+      lock synchronized {
+        val view = Option(segments.floorKey(from)).map { floor =>
+          segments.subMap(floor, to)
+        }.getOrElse(segments.headMap(to))
+        view.values.asScala
+      }
     }
   }
 

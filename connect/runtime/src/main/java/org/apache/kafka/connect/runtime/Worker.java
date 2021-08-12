@@ -104,8 +104,8 @@ public class Worker {
     private final ConcurrentMap<String, WorkerConnector> connectors = new ConcurrentHashMap<>();
     private final ConcurrentMap<ConnectorTaskId, WorkerTask> tasks = new ConcurrentHashMap<>();
     private SourceTaskOffsetCommitter sourceTaskOffsetCommitter;
-    private WorkerConfigTransformer workerConfigTransformer;
-    private ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy;
+    private final WorkerConfigTransformer workerConfigTransformer;
+    private final ConnectorClientConfigOverridePolicy connectorClientConfigOverridePolicy;
 
     public Worker(
         String workerId,
@@ -220,6 +220,8 @@ public class Worker {
 
         workerMetricsGroup.close();
         connectorStatusMetricsGroup.close();
+
+        workerConfigTransformer.close();
     }
 
     /**
@@ -537,7 +539,7 @@ public class Worker {
                                       valueConverter, headerConverter, transformationChain, consumer, loader, time,
                                       retryWithToleranceOperator);
         } else {
-            log.error("Tasks must be a subclass of either SourceTask or SinkTask", task);
+            log.error("Tasks must be a subclass of either SourceTask or SinkTask and current is {}", task);
             throw new ConnectException("Tasks must be a subclass of either SourceTask or SinkTask");
         }
     }
@@ -731,12 +733,17 @@ public class Worker {
                 return;
             }
 
-            connectorStatusMetricsGroup.recordTaskRemoved(taskId);
             if (!task.awaitStop(timeout)) {
                 log.error("Graceful stop of task {} failed.", task.id());
                 task.cancel();
             } else {
                 log.debug("Graceful stop of task {} succeeded.", task.id());
+            }
+
+            try {
+                task.removeMetrics();
+            } finally {
+                connectorStatusMetricsGroup.recordTaskRemoved(taskId);
             }
         }
     }
@@ -854,11 +861,11 @@ public class Worker {
     }
 
     static class ConnectorStatusMetricsGroup {
-        private ConnectMetrics connectMetrics;
-        private ConnectMetricsRegistry registry;
-        private ConcurrentMap<String, MetricGroup> connectorStatusMetrics = new ConcurrentHashMap<>();
-        private Herder herder;
-        private ConcurrentMap<ConnectorTaskId, WorkerTask> tasks;
+        private final ConnectMetrics connectMetrics;
+        private final ConnectMetricsRegistry registry;
+        private final ConcurrentMap<String, MetricGroup> connectorStatusMetrics = new ConcurrentHashMap<>();
+        private final Herder herder;
+        private final ConcurrentMap<ConnectorTaskId, WorkerTask> tasks;
 
 
         protected ConnectorStatusMetricsGroup(

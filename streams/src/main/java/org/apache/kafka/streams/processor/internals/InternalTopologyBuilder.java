@@ -1190,6 +1190,10 @@ public class InternalTopologyBuilder {
         return decoratedTopics;
     }
 
+    public String decoratePseudoTopic(final String topic) {
+        return decorateTopic(topic);
+    }
+
     private String decorateTopic(final String topic) {
         if (applicationId == null) {
             throw new TopologyException("there are internal topics and "
@@ -1229,6 +1233,10 @@ public class InternalTopologyBuilder {
         this.subscriptionUpdates = subscriptionUpdates;
         setRegexMatchedTopicsToSourceNodes();
         setRegexMatchedTopicToStateStore();
+    }
+
+    public boolean hasNoNonGlobalTopology() {
+        return sourceTopicNames.isEmpty() && nodeToSourcePatterns.isEmpty();
     }
 
     private boolean isGlobalSource(final String nodeName) {

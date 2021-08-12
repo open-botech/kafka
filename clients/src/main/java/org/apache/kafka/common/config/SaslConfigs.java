@@ -70,6 +70,7 @@ public class SaslConfigs {
         + "listener.name.sasl_ssl.scram-sha-256.sasl.login.class=com.example.CustomScramLogin";
 
     public static final String SASL_KERBEROS_SERVICE_NAME = "sasl.kerberos.service.name";
+    public static final String SASL_KERBEROS_DOMAIN_NAME = "kerberos.domain.name";
     public static final String SASL_KERBEROS_SERVICE_NAME_DOC = "The Kerberos principal name that Kafka runs as. "
         + "This can be defined either in Kafka's JAAS config or in Kafka's config.";
 
@@ -136,6 +137,7 @@ public class SaslConfigs {
 
     public static void addClientSaslSupport(ConfigDef config) {
         config.define(SaslConfigs.SASL_KERBEROS_SERVICE_NAME, ConfigDef.Type.STRING, null, ConfigDef.Importance.MEDIUM, SaslConfigs.SASL_KERBEROS_SERVICE_NAME_DOC)
+                .define(SaslConfigs.SASL_KERBEROS_DOMAIN_NAME, ConfigDef.Type.STRING, null,null,null)
                 .define(SaslConfigs.SASL_KERBEROS_KINIT_CMD, ConfigDef.Type.STRING, SaslConfigs.DEFAULT_KERBEROS_KINIT_CMD, ConfigDef.Importance.LOW, SaslConfigs.SASL_KERBEROS_KINIT_CMD_DOC)
                 .define(SaslConfigs.SASL_KERBEROS_TICKET_RENEW_WINDOW_FACTOR, ConfigDef.Type.DOUBLE, SaslConfigs.DEFAULT_KERBEROS_TICKET_RENEW_WINDOW_FACTOR, ConfigDef.Importance.LOW, SaslConfigs.SASL_KERBEROS_TICKET_RENEW_WINDOW_FACTOR_DOC)
                 .define(SaslConfigs.SASL_KERBEROS_TICKET_RENEW_JITTER, ConfigDef.Type.DOUBLE, SaslConfigs.DEFAULT_KERBEROS_TICKET_RENEW_JITTER, ConfigDef.Importance.LOW, SaslConfigs.SASL_KERBEROS_TICKET_RENEW_JITTER_DOC)
